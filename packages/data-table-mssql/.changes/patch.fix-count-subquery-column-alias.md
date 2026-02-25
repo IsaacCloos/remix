@@ -1,0 +1,1 @@
+Fix count/exists subquery missing column alias for MSSQL derived tables; add unit tests for raw SQL placeholder rewriting, T-SQL savepoint lifecycle, TOP (n) pagination, OFFSET…FETCH NEXT pagination, and OUTPUT inserted.* when capabilities.returning is enabled

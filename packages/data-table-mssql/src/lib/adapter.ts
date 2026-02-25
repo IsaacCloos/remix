@@ -1,0 +1,295 @@
+import type {
+  AdapterCapabilityOverrides,
+  AdapterExecuteRequest,
+  AdapterResult,
+  DatabaseAdapter,
+  TransactionOptions,
+  TransactionToken,
+} from '@remix-run/data-table'
+import { getTablePrimaryKey } from '@remix-run/data-table'
+
+import { compileMssqlStatement } from './sql-compiler.ts'
+
+/**
+ * Result shape returned by mssql request `query()` calls.
+ */
+export type MssqlQueryResult = {
+  recordset?: unknown[]
+  rowsAffected?: number[]
+}
+
+/**
+ * Minimal mssql request contract used by this adapter.
+ */
+export type MssqlDatabaseRequest = {
+  input(name: string, value: unknown): MssqlDatabaseRequest
+  query(text: string): Promise<MssqlQueryResult>
+}
+
+/**
+ * Minimal mssql queryable contract used by this adapter.
+ */
+type MssqlDatabaseQueryable = {
+  request(): MssqlDatabaseRequest
+}
+
+/**
+ * Minimal mssql transaction contract used by this adapter.
+ */
+export type MssqlDatabaseTransaction = MssqlDatabaseQueryable & {
+  begin(): Promise<void>
+  commit(): Promise<void>
+  rollback(): Promise<void>
+}
+
+/**
+ * Minimal mssql pool contract used by this adapter.
+ */
+export type MssqlDatabasePool = MssqlDatabaseQueryable & {
+  transaction(): MssqlDatabaseTransaction
+}
+
+/**
+ * Mssql adapter configuration.
+ */
+export type MssqlDatabaseAdapterOptions = {
+  capabilities?: AdapterCapabilityOverrides
+}
+
+/**
+ * `DatabaseAdapter` implementation for mssql-compatible pools.
+ */
+export class MssqlDatabaseAdapter implements DatabaseAdapter {
+  dialect = 'mssql'
+  capabilities
+
+  #pool: MssqlDatabasePool
+  #transactions = new Map<string, MssqlDatabaseTransaction>()
+  #transactionCounter = 0
+
+  constructor(pool: MssqlDatabasePool, options?: MssqlDatabaseAdapterOptions) {
+    this.#pool = pool
+    this.capabilities = {
+      returning: options?.capabilities?.returning ?? false,
+      savepoints: options?.capabilities?.savepoints ?? true,
+      upsert: options?.capabilities?.upsert ?? true,
+    }
+  }
+
+  async execute(request: AdapterExecuteRequest): Promise<AdapterResult> {
+    if (request.statement.kind === 'insertMany' && request.statement.values.length === 0) {
+      return {
+        affectedRows: 0,
+        insertId: undefined,
+        rows: request.statement.returning ? [] : undefined,
+      }
+    }
+
+    let statement = compileMssqlStatement(request.statement)
+    let queryable = this.#resolveQueryable(request.transaction)
+    let result = await runMssqlQuery(queryable, statement.text, statement.values)
+    let rows = normalizeRows(result.recordset ?? [])
+
+    if (request.statement.kind === 'count' || request.statement.kind === 'exists') {
+      rows = normalizeCountRows(rows)
+    }
+
+    return {
+      rows,
+      affectedRows: normalizeAffectedRows(request.statement.kind, result.rowsAffected),
+      insertId: normalizeInsertId(request.statement.kind, request.statement, rows),
+    }
+  }
+
+  async beginTransaction(options?: TransactionOptions): Promise<TransactionToken> {
+    let transaction = this.#pool.transaction()
+    await transaction.begin()
+
+    if (options?.isolationLevel) {
+      await runMssqlQuery(transaction, 'set transaction isolation level ' + options.isolationLevel)
+    }
+
+    this.#transactionCounter += 1
+    let token = { id: 'tx_' + String(this.#transactionCounter) }
+
+    this.#transactions.set(token.id, transaction)
+
+    return token
+  }
+
+  async commitTransaction(token: TransactionToken): Promise<void> {
+    let transaction = this.#transaction(token)
+
+    try {
+      await transaction.commit()
+    } finally {
+      this.#transactions.delete(token.id)
+    }
+  }
+
+  async rollbackTransaction(token: TransactionToken): Promise<void> {
+    let transaction = this.#transaction(token)
+
+    try {
+      await transaction.rollback()
+    } finally {
+      this.#transactions.delete(token.id)
+    }
+  }
+
+  async createSavepoint(token: TransactionToken, name: string): Promise<void> {
+    let transaction = this.#transaction(token)
+    await runMssqlQuery(transaction, 'save transaction ' + quoteIdentifier(name))
+  }
+
+  async rollbackToSavepoint(token: TransactionToken, name: string): Promise<void> {
+    let transaction = this.#transaction(token)
+    await runMssqlQuery(transaction, 'rollback transaction ' + quoteIdentifier(name))
+  }
+
+  async releaseSavepoint(token: TransactionToken): Promise<void> {
+    this.#transaction(token)
+  }
+
+  #resolveQueryable(token: TransactionToken | undefined): MssqlDatabaseQueryable {
+    if (!token) {
+      return this.#pool
+    }
+
+    return this.#transaction(token)
+  }
+
+  #transaction(token: TransactionToken): MssqlDatabaseTransaction {
+    let transaction = this.#transactions.get(token.id)
+
+    if (!transaction) {
+      throw new Error('Unknown transaction token: ' + token.id)
+    }
+
+    return transaction
+  }
+}
+
+/**
+ * Creates a mssql `DatabaseAdapter`.
+ * @param pool Mssql connection pool.
+ * @param options Optional adapter capability overrides.
+ * @returns A configured mssql adapter.
+ */
+export function createMssqlDatabaseAdapter(
+  pool: MssqlDatabasePool,
+  options?: MssqlDatabaseAdapterOptions,
+): MssqlDatabaseAdapter {
+  return new MssqlDatabaseAdapter(pool, options)
+}
+
+async function runMssqlQuery(
+  queryable: MssqlDatabaseQueryable,
+  text: string,
+  values: unknown[] = [],
+): Promise<MssqlQueryResult> {
+  let request = queryable.request()
+
+  for (let index = 0; index < values.length; index += 1) {
+    request.input('p' + String(index + 1), values[index])
+  }
+
+  return request.query(text)
+}
+
+function normalizeRows(rows: unknown[]): Record<string, unknown>[] {
+  return rows.map((row) => {
+    if (typeof row !== 'object' || row === null) {
+      return {}
+    }
+
+    return { ...(row as Record<string, unknown>) }
+  })
+}
+
+function normalizeCountRows(rows: Record<string, unknown>[]): Record<string, unknown>[] {
+  return rows.map((row) => {
+    let count = row.count
+
+    if (typeof count === 'string') {
+      let numeric = Number(count)
+
+      if (!Number.isNaN(numeric)) {
+        return {
+          ...row,
+          count: numeric,
+        }
+      }
+    }
+
+    if (typeof count === 'bigint') {
+      return {
+        ...row,
+        count: Number(count),
+      }
+    }
+
+    return row
+  })
+}
+
+function normalizeAffectedRows(
+  kind: AdapterExecuteRequest['statement']['kind'],
+  rowsAffected: number[] | undefined,
+): number | undefined {
+  if (kind === 'select' || kind === 'count' || kind === 'exists') {
+    return undefined
+  }
+
+  if (!rowsAffected || rowsAffected.length === 0) {
+    return undefined
+  }
+
+  let total = 0
+
+  for (let amount of rowsAffected) {
+    total += amount
+  }
+
+  return total
+}
+
+function normalizeInsertId(
+  kind: AdapterExecuteRequest['statement']['kind'],
+  statement: AdapterExecuteRequest['statement'],
+  rows: Record<string, unknown>[],
+): unknown {
+  if (!isInsertStatementKind(kind) || !isInsertStatement(statement)) {
+    return undefined
+  }
+
+  let primaryKey = getTablePrimaryKey(statement.table)
+
+  if (primaryKey.length !== 1) {
+    return undefined
+  }
+
+  let key = primaryKey[0]
+  let row = rows[rows.length - 1]
+
+  return row ? row[key] : undefined
+}
+
+function quoteIdentifier(value: string): string {
+  return '[' + value.replace(/]/g, ']]') + ']'
+}
+
+function isInsertStatementKind(kind: AdapterExecuteRequest['statement']['kind']): boolean {
+  return kind === 'insert' || kind === 'insertMany' || kind === 'upsert'
+}
+
+function isInsertStatement(
+  statement: AdapterExecuteRequest['statement'],
+): statement is Extract<
+  AdapterExecuteRequest['statement'],
+  { kind: 'insert' | 'insertMany' | 'upsert' }
+> {
+  return (
+    statement.kind === 'insert' || statement.kind === 'insertMany' || statement.kind === 'upsert'
+  )
+}
