@@ -40,6 +40,23 @@ Use `db.query(...)`, relation loading, and transactions from `remix/data-table`.
 - `savepoints: true`
 - `upsert: true`
 
+### `returning` On MSSQL
+
+MSSQL does not support the `RETURNING` clause used by Postgres and SQLite.
+When `returning` is `false` (the default), operations like
+`db.create(table, values, { returnRow: true })` issue a follow-up `SELECT` to
+fetch the created row.
+
+MSSQL _does_ support the `OUTPUT` clause which can serve a similar role. If you
+enable the capability override the adapter will use `OUTPUT inserted.*` /
+`OUTPUT deleted.*` instead of a follow-up query:
+
+```ts
+let adapter = createMssqlDatabaseAdapter(pool, {
+  capabilities: { returning: true },
+})
+```
+
 ## Advanced Usage
 
 ### Transaction Options
@@ -71,6 +88,7 @@ let adapter = createMssqlDatabaseAdapter(pool, {
 
 - [`data-table`](https://github.com/remix-run/remix/tree/main/packages/data-table) - Core query/relations API
 - [`data-schema`](https://github.com/remix-run/remix/tree/main/packages/data-schema) - Schema definitions and validation
+- [`data-table-postgres`](https://github.com/remix-run/remix/tree/main/packages/data-table-postgres) - Postgres adapter
 - [`data-table-mysql`](https://github.com/remix-run/remix/tree/main/packages/data-table-mysql) - MySQL adapter
 - [`data-table-sqlite`](https://github.com/remix-run/remix/tree/main/packages/data-table-sqlite) - SQLite adapter
 

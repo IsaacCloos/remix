@@ -110,57 +110,6 @@ export function compileMssqlStatement(statement: AdapterStatement): CompiledSql 
   throw new Error('Unsupported statement kind')
 }
 
-function compileUpsertStatement(statement: UpsertStatement, context: CompileContext): CompiledSql {
-  let insertColumns = Object.keys(statement.values)
-
-  if (insertColumns.length === 0) {
-    throw new Error('upsert requires at least one value')
-  }
-
-  let conflictTarget = statement.conflictTarget ?? [...getTablePrimaryKey(statement.table)]
-
-  if (conflictTarget.length === 0) {
-    throw new Error('upsert requires at least one conflict target column')
-  }
-
-  let sourceValues = insertColumns.map((column) => pushValue(context, statement.values[column]))
-
-  let updateValues = statement.update ?? statement.values
-  let updateColumns = Object.keys(updateValues)
-  let whenMatchedClause = ''
-
-  if (updateColumns.length > 0) {
-    whenMatchedClause =
-      ' when matched then update set ' +
-      updateColumns
-        .map((column) => 'target.' + quotePath(column) + ' = ' + pushValue(context, updateValues[column]))
-        .join(', ')
-  }
-
-  return {
-    text:
-      'merge ' +
-      quoteIdentifier(getTableName(statement.table)) +
-      ' with (holdlock) as target using (values (' +
-      sourceValues.join(', ') +
-      ')) as source (' +
-      insertColumns.map((column) => quotePath(column)).join(', ') +
-      ') on ' +
-      conflictTarget
-        .map((column) => 'target.' + quotePath(column) + ' = source.' + quotePath(column))
-        .join(' and ') +
-      whenMatchedClause +
-      ' when not matched then insert (' +
-      insertColumns.map((column) => quotePath(column)).join(', ') +
-      ') values (' +
-      insertColumns.map((column) => 'source.' + quotePath(column)).join(', ') +
-      ')' +
-      compileOutputClause(statement.returning, 'inserted') +
-      ';',
-    values: context.values,
-  }
-}
-
 function compileInsertStatement(
   table: StatementTable,
   values: Record<string, unknown>,
@@ -243,6 +192,57 @@ function compileInsertManyStatement(
             ')',
         )
         .join(', '),
+    values: context.values,
+  }
+}
+
+function compileUpsertStatement(statement: UpsertStatement, context: CompileContext): CompiledSql {
+  let insertColumns = Object.keys(statement.values)
+
+  if (insertColumns.length === 0) {
+    throw new Error('upsert requires at least one value')
+  }
+
+  let conflictTarget = statement.conflictTarget ?? [...getTablePrimaryKey(statement.table)]
+
+  if (conflictTarget.length === 0) {
+    throw new Error('upsert requires at least one conflict target column')
+  }
+
+  let sourceValues = insertColumns.map((column) => pushValue(context, statement.values[column]))
+
+  let updateValues = statement.update ?? statement.values
+  let updateColumns = Object.keys(updateValues)
+  let whenMatchedClause = ''
+
+  if (updateColumns.length > 0) {
+    whenMatchedClause =
+      ' when matched then update set ' +
+      updateColumns
+        .map((column) => 'target.' + quotePath(column) + ' = ' + pushValue(context, updateValues[column]))
+        .join(', ')
+  }
+
+  return {
+    text:
+      'merge ' +
+      quoteIdentifier(getTableName(statement.table)) +
+      ' with (holdlock) as target using (values (' +
+      sourceValues.join(', ') +
+      ')) as source (' +
+      insertColumns.map((column) => quotePath(column)).join(', ') +
+      ') on ' +
+      conflictTarget
+        .map((column) => 'target.' + quotePath(column) + ' = source.' + quotePath(column))
+        .join(' and ') +
+      whenMatchedClause +
+      ' when not matched then insert (' +
+      insertColumns.map((column) => quotePath(column)).join(', ') +
+      ') values (' +
+      insertColumns.map((column) => 'source.' + quotePath(column)).join(', ') +
+      ')' +
+      compileOutputClause(statement.returning, 'inserted') +
+      ';',
     values: context.values,
   }
 }

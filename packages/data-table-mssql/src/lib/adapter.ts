@@ -37,16 +37,22 @@ type MssqlDatabaseQueryable = {
  * Minimal mssql transaction contract used by this adapter.
  */
 export type MssqlDatabaseTransaction = MssqlDatabaseQueryable & {
-  begin(): Promise<void>
   commit(): Promise<void>
   rollback(): Promise<void>
+}
+
+/**
+ * Internal handle returned by pool.transaction() before begin() is called.
+ */
+type MssqlTransactionHandle = MssqlDatabaseTransaction & {
+  begin(): Promise<unknown>
 }
 
 /**
  * Minimal mssql pool contract used by this adapter.
  */
 export type MssqlDatabasePool = MssqlDatabaseQueryable & {
-  transaction(): MssqlDatabaseTransaction
+  transaction(): MssqlTransactionHandle
 }
 
 /**
@@ -63,12 +69,12 @@ export class MssqlDatabaseAdapter implements DatabaseAdapter {
   dialect = 'mssql'
   capabilities
 
-  #pool: MssqlDatabasePool
+  #client: MssqlDatabasePool
   #transactions = new Map<string, MssqlDatabaseTransaction>()
   #transactionCounter = 0
 
-  constructor(pool: MssqlDatabasePool, options?: MssqlDatabaseAdapterOptions) {
-    this.#pool = pool
+  constructor(client: MssqlDatabasePool, options?: MssqlDatabaseAdapterOptions) {
+    this.#client = client
     this.capabilities = {
       returning: options?.capabilities?.returning ?? false,
       savepoints: options?.capabilities?.savepoints ?? true,
@@ -86,7 +92,7 @@ export class MssqlDatabaseAdapter implements DatabaseAdapter {
     }
 
     let statement = compileMssqlStatement(request.statement)
-    let queryable = this.#resolveQueryable(request.transaction)
+    let queryable = this.#resolveClient(request.transaction)
     let result = await runMssqlQuery(queryable, statement.text, statement.values)
     let rows = normalizeRows(result.recordset ?? [])
 
@@ -102,11 +108,18 @@ export class MssqlDatabaseAdapter implements DatabaseAdapter {
   }
 
   async beginTransaction(options?: TransactionOptions): Promise<TransactionToken> {
-    let transaction = this.#pool.transaction()
+    let transaction = this.#client.transaction()
     await transaction.begin()
 
     if (options?.isolationLevel) {
       await runMssqlQuery(transaction, 'set transaction isolation level ' + options.isolationLevel)
+    }
+
+    if (options?.readOnly !== undefined) {
+      await runMssqlQuery(
+        transaction,
+        options.readOnly ? 'set transaction read only' : 'set transaction read write',
+      )
     }
 
     this.#transactionCounter += 1
@@ -118,7 +131,7 @@ export class MssqlDatabaseAdapter implements DatabaseAdapter {
   }
 
   async commitTransaction(token: TransactionToken): Promise<void> {
-    let transaction = this.#transaction(token)
+    let transaction = this.#transactionClient(token)
 
     try {
       await transaction.commit()
@@ -128,7 +141,7 @@ export class MssqlDatabaseAdapter implements DatabaseAdapter {
   }
 
   async rollbackTransaction(token: TransactionToken): Promise<void> {
-    let transaction = this.#transaction(token)
+    let transaction = this.#transactionClient(token)
 
     try {
       await transaction.rollback()
@@ -138,28 +151,29 @@ export class MssqlDatabaseAdapter implements DatabaseAdapter {
   }
 
   async createSavepoint(token: TransactionToken, name: string): Promise<void> {
-    let transaction = this.#transaction(token)
+    let transaction = this.#transactionClient(token)
     await runMssqlQuery(transaction, 'save transaction ' + quoteIdentifier(name))
   }
 
   async rollbackToSavepoint(token: TransactionToken, name: string): Promise<void> {
-    let transaction = this.#transaction(token)
+    let transaction = this.#transactionClient(token)
     await runMssqlQuery(transaction, 'rollback transaction ' + quoteIdentifier(name))
   }
 
-  async releaseSavepoint(token: TransactionToken): Promise<void> {
-    this.#transaction(token)
+  // MSSQL does not support RELEASE SAVEPOINT — this is intentionally a no-op.
+  async releaseSavepoint(token: TransactionToken, _name: string): Promise<void> {
+    this.#transactionClient(token)
   }
 
-  #resolveQueryable(token: TransactionToken | undefined): MssqlDatabaseQueryable {
+  #resolveClient(token: TransactionToken | undefined): MssqlDatabaseQueryable {
     if (!token) {
-      return this.#pool
+      return this.#client
     }
 
-    return this.#transaction(token)
+    return this.#transactionClient(token)
   }
 
-  #transaction(token: TransactionToken): MssqlDatabaseTransaction {
+  #transactionClient(token: TransactionToken): MssqlDatabaseTransaction {
     let transaction = this.#transactions.get(token.id)
 
     if (!transaction) {
@@ -172,15 +186,15 @@ export class MssqlDatabaseAdapter implements DatabaseAdapter {
 
 /**
  * Creates a mssql `DatabaseAdapter`.
- * @param pool Mssql connection pool.
+ * @param client Mssql connection pool.
  * @param options Optional adapter capability overrides.
  * @returns A configured mssql adapter.
  */
 export function createMssqlDatabaseAdapter(
-  pool: MssqlDatabasePool,
+  client: MssqlDatabasePool,
   options?: MssqlDatabaseAdapterOptions,
 ): MssqlDatabaseAdapter {
-  return new MssqlDatabaseAdapter(pool, options)
+  return new MssqlDatabaseAdapter(client, options)
 }
 
 async function runMssqlQuery(
@@ -237,7 +251,7 @@ function normalizeAffectedRows(
   kind: AdapterExecuteRequest['statement']['kind'],
   rowsAffected: number[] | undefined,
 ): number | undefined {
-  if (kind === 'select' || kind === 'count' || kind === 'exists') {
+  if (kind === 'select' || kind === 'count' || kind === 'exists' || kind === 'raw') {
     return undefined
   }
 

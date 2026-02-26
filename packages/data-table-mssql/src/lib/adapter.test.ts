@@ -106,7 +106,7 @@ describe('mssql adapter', () => {
     assert.deepEqual(lifecycle, ['transaction', 'begin', 'query', 'commit'])
   })
 
-  it('applies transaction options when isolation level is provided', async () => {
+  it('applies transaction options when provided', async () => {
     let lifecycle: string[] = []
 
     let transaction = {
@@ -151,7 +151,7 @@ describe('mssql adapter', () => {
       readOnly: true,
     })
 
-    assert.deepEqual(lifecycle, ['begin', 'set transaction isolation level serializable', 'commit'])
+    assert.deepEqual(lifecycle, ['begin', 'set transaction isolation level serializable', 'set transaction read only', 'commit'])
   })
 
   it('compiles column-to-column comparisons from string references', async () => {
